@@ -1,80 +1,104 @@
-# SRE Incident Response Agent (ADK & MiniMax-M2)
-This system is an agentic workflow built with the Google Agent Development Kit (ADK). It automates SRE incident management. The system uses a multi-agent hierarchy to research, triage, remediate, and report on DevOps incidents. Complex reasoning tasks, including detailed incident analysis and root cause identification, are powered by the MiniMax-M2 model.
+# SRE Incident Response Agent (ADK & mistral)
+This system is an agentic workflow built with the Google Agent Development Kit (ADK). It automates SRE incident management using a multi-agent hierarchy to research, triage, remediate, and report on DevOps incidents. Complex reasoning tasks are powered by the mistral:7b model.
 
 ## Overview
-This project automates the end-to-end incident response pipeline. The RootAgent serves as a central orchestrator, dynamically routing user alerts to specialized sub-agents based on the state of the incident. To facilitate real-time monitoring and human-in-the-loop (HITL) oversight, the project integrates ADK Web. This provides a graphical interface to visualize agent reasoning paths, monitor sub-agent handoffs, and manually approve remediation steps (like rollbacks) that the agents propose.
+This project automates the end-to-end incident response pipeline. The RootAgent acts as a central orchestrator, dynamically routing user alerts to specialized sub-agents based on the incident state.
+
+Integration with ADK Web provides a graphical interface for real-time monitoring and human-in-the-loop (HITL) oversight, allowing visualization of agent reasoning paths, monitoring sub-agent handoffs, and manual approval of remediation steps
 
 ### Key Components
   *  Orchestration: A hierarchical routing model using the Agent class.
-  *  LLM: MiniMax-M2: Powers complex triage, runbook generation, and remediation logic via LiteLlm.
+  *  LLM: mistral:7b powers complex triage, runbook generation, and remediation logic via LiteLlm.
 
 ## Agent Roles
 | Agent          |    Purpose
 -----------------|:---------------------
 | TriageAgent    |  Analyzes incident data, identifies core issues, and flags data gaps.
 | RunbookAgent   |  Generates internal suggested runbooks for the engineering review.
-| RemediationAgent |  Proposes fixes, distinguishing between auto-tasks and manual rollbacks.
-| PostmortemAgent  |  Compiles final internal post-incident reports.
-| UpdatePostAgent  |  Formats status updates for internal and external stakeholders.
+| RemediationAgent |  Proposes fixes and actions, distinguishing between auto-tasks and manual rollbacks.
+| PostmortemAgent  |  Compiles final internal post-incident reports and root cause analysis.
+| StatusUpdateAgent  |  Formats status updates for both internal teams and external stakeholders.
 
 ## Configuration & Installation
 Prerequisites
    * Python 3.10+
-   * Hugging Face API Token (for MiniMax-M2 access)
-   * Google Account (Optional): Only needed if you choose to deploy the agent to Google Cloud services like Vertex AI Agent Engine later. Local development with Hugging Face models does not require this setup.
+   * Ollama: access to the mistral:7b model.
+   * LiteLLM: initializes an LLM instance allowing you to interact with a model.
+   * Google Account (Optional): Only needed if you choose to deploy the agent to Google Cloud services like Vertex AI Agent Engine later. Local development with Ollama models does not require this setup.
 
 **Setup**
 1. Clone the repository:
-```
-git clone https://github.com/shjawale/SRE-Incident-Response-Agent.git
-cd sre-incident-agent
-```
+    ```
+    git clone https://github.com/shjawale/SRE-Incident-Response-Agent.git
+    cd sre-incident-agent
+    ```
 
-2. Create and activate a Virtual Environment:
+2. Install Ollama and the Mistral model:
+
+    Download and install Ollama from the official website.
+    Open your terminal or command prompt and run the following command to download the mistral model:
+    ```
+    ollama pull mistral:7b
+    ```
+
+3. Create and activate a Virtual Environment:
 
     A virtual environment ensures that the ADK and LiteLLM dependencies do not conflict with the global Python installation.
-```
-# Create the environment
-python -m venv venv
 
-# Activate it (Windows)
-.\venv\Scripts\activate
+    ```
+    # Create the environment
+    python -m venv venv
 
-# Activate it (macOS/Linux)
-source venv/bin/activate
-```
+    # Activate it
+    .\venv\Scripts\activate     (Windows)
+    source venv/bin/activate    (macOS/Linux)
+    ```
 
-3. Install dependencies:
-```
-pip install google-adk litellm httpx python-dotenv 
-```
-4. Configure Environment Variables:
+4. Install dependencies:
+
+    ```
+    pip install google-adk litellm httpx python-dotenv
+    ```
+
+5. Configure Environment Variables:
 
     Create a .env file in the root directory and add credentials. Refer to .env.example for the required format:
-```
-HUGGINGFACE_API_TOKEN=your_hf_token
-```
+    ```
+    OPENAI_API_KEY=<your key>
+    ```
 
 **Usage**
 
-1. To utilize the agents directly in code, instantiate the RootAgent and provide user queries regarding incidents. The RootAgent will manage the delegation to the appropriate sub-agent.
-python
-```
-from google.adk.agents import Agent
-from google.adk.models.lite_llm import LiteLlm
+1. Direct Execution in Code
 
-# Example of initiating the root agent
-root_agent.run("We are seeing 500 errors in the checkout service.")
-```
+    To utilize the agents directly in code, instantiate the RootAgent and provide user queries regarding incidents. The RootAgent will manage the delegation to the appropriate sub-agent.
+    python
+    ```
+    from google.adk.agents import Agent
+    from google.adk.models.lite_llm import LiteLlm
+
+    # LiteLLM automatically uses the local Ollama API for the 'ollama/mistral' model
+    SRE_MODEL = LiteLlm(model="ollama/mistral:7b", api_base="http://localhost:11434")
+
+    # Example of initiating the root agent
+    root_agent.run("We are seeing Error 503 in the checkout service.")
+    ```
 
 2. Interactive UI via ADK Web
-For an enterprise-grade experience, you can launch the ADK Web interface. This is highly recommended for SRE teams as it provides:
-  *  Traceability: View the step-by-step reasoning logs of the MiniMax-M2 model.
-  *  Agent Monitoring: Watch the RootAgent "delegate" tasks to the Triage or Remediation agents in real-time.
-  *  Human Approval: A dedicated interface to review and authorize the RemediationAgent’s suggested tasks before they are executed.
 
-To start the web interface, run:
-```
-# Command to launch the ADK Web server
-python -m google.adk.web --agent root_agent
-```
+    For an enterprise-grade experience, you can launch the ADK Web interface to get traceability, agent monitoring, and human approval interfaces. Ensure your Ollama application is running in the background.
+
+    To start the web interface, run:
+    ```
+    # Command to launch the ADK Web server
+    python -m google.adk.web --agent root_agent
+    ```
+
+**Generated Files**
+
+When the agent is run locally, specific Python functions write various incident-related documents to the filesystem. The following functions create the corresponding files:
+
+  *  incident_state.json: Created and updated by the save_manual_telemetry function.
+  *  incident_timeline.txt: Appended to by the update_incident_timeline function to maintain a chronological log of actions.
+  *  notification_broadcast.log: Appended to by the send_external_notification function when broadcasting status updates.
+  *  {report_type}_{uuid}.md (e.g., postmortem_report_{uuid}.md): Created by the archive_validated_report function, which saves the final postmortem report with a unique identifier.
