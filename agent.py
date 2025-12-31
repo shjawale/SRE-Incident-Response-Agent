@@ -15,8 +15,26 @@ from google.adk.tools.agent_tool import AgentTool
 
 
 from fastapi import FastAPI, HTTPException
+from fastapi import Response, Request
 from pydantic import BaseModel
 import uvicorn
+
+
+from prometheus_client import make_asgi_app, Counter
+from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
+from google.adk.apps import App
+from prometheus_client import start_http_server, Counter, Gauge
+import time
+from google.adk.cli.fast_api import get_fast_api_app 
+
+
+SIMULATION_LOG_FILE = "service_simulation.log"
+
+
+INCIDENTS_RESOLVED = Counter('sre_agent_incidents_resolved_total', 'Total incidents handled by agent')
+AGENT_HEALTH = Gauge('sre_agent_health_status', 'Current health of the response agent (1=OK, 0=FAIL)')
+SRE_INCIDENTS_API = Counter('sre_incidents_total', 'Total incidents handled')
+
 
 load_dotenv()
 
@@ -179,8 +197,6 @@ def archive_validated_report(content: str, report_type: str) -> str:
         return f"SYSTEM ERROR: Could not write file: {str(e)}"
 
 
-SIMULATION_LOG_FILE = "service_simulation.log"
-
 def generate_mock_logs(service_name: str, num_entries: int = 50):
     """Generates a large number of simulated log entries, including some errors."""
     error_patterns = ["ConnectionResetError", "503 Service Unavailable", "MemoryLeakWarning", "TimeoutError"]
@@ -318,10 +334,10 @@ def transfer_to_remediation():
     """Transfer to the RemediationAgent to apply fixes."""
     return remediation_agent
 
-root_agent = Agent(
-    model=SRE_MODEL,
+
+root_agent = SequentialAgent(
     name='root_agent',
-    instruction="""
+    description="""
     You are the SRE Incident Commander. You manage the lifecycle of a P1/P2 incident. 
     Strategic Mandate: Do not perform technical analysis yourself. Orchestrate specialized agents and maintain the 'incident_timeline'.
     Operational Workflow (Follow in strict sequence):
@@ -329,7 +345,8 @@ root_agent = Agent(
     Delegate Triage: Update the timeline, then call transfer_to_triage. Wait for a triage_report.
     Strategize Runbook: Call send_external_notification (Stakeholders), then call transfer_to_runbook to generate a mitigation plan.
     Execute Remediation: Call transfer_to_remediation. Safety Gate: Ensure the agent requests human approval for destructive actions. Update the timeline with specific actions taken.
-    Verify & Close: Call send_external_notification (Slack). Call transfer_to_postmortem. Final Step: Call archive_validated_report to officially close the incident. 
+    Verify & Close: Call send_external_notification (Slack). Call transfer_to_postmortem. 
+    Final Step: Call archive_validated_report to officially close the incident. 
     
     Strict Constraints
     Do not announce transfers textually. Execute the tool call only.
@@ -337,13 +354,6 @@ root_agent = Agent(
     Every tool call or agent transfer must be logged via update_incident_timeline.
     If the user requests a specific phase (e.g., "Run triage"), jump directly to that step.
     """,
-    tools=[
-        archive_validated_report, 
-        fetch_telemetry_checkpoint, 
-        send_external_notification, 
-        update_incident_timeline,
-        save_manual_telemetry,
-    ],
     sub_agents=[
         triage_agent, 
         runbook_agent,
@@ -354,33 +364,89 @@ root_agent = Agent(
 )
 
 
-from google.adk.apps import App
+## Prometheus
 
-app = App(name="agent_project", root_agent=root_agent)
+def monitor_and_respond():
+    """Main loop for your SRE agent"""
+    AGENT_HEALTH.set(1) # Mark agent as healthy
+    
+    while True:
+        # Simulate incident detection and response
+        if random.random() > 0.8:
+            print("Incident detected! Automating response...")
+            INCIDENTS_RESOLVED.inc()
+        
+        time.sleep(5)
 
-#app = FastAPI(title="SRE Agent API")
+
+
+#app = App(name="incident_response", root_agent=root_agent)
+
+# Create the main FastAPI application
+app = FastAPI(title="SRE Agent API")
+
+# Create the ADK App instance
+#adk_app_instance = App(name="incident_response", root_agent=root_agent)
+
+# Mount the ADK app onto the main FastAPI app
+#app.mount("/adk", adk_app_instance.app) # Now 'mount' is a valid method on app
+
+# Create the main FastAPI application using the ADK helper
+# The helper function will automatically find my agent definitions in the file
+#app = get_fast_api_app()
+
+# Mount prometheus metrics to the /metrics path
+#metrics_app = make_asgi_app() 
+#app.mount("/metrics", metrics_app) # Mount metrics to the main app
+
+
+@app.get("/metrics")
+def metrics():
+    return Response(content=generate_latest(), media_type=CONTENT_TYPE_LATEST)
+
+
+@app.get("/")
+async def root():
+    SRE_INCIDENTS_API.inc()
+    return {"message": "SRE Agent API is Running"}
+
 
 class IncidentRequest(BaseModel):
     report: str
     user_id: str = "sre_user_01"
     session_id: str = str(uuid.uuid4())
 
-#@app.post("/triage")
+
+class IncidentResolutionResponse(BaseModel):
+    status: str
+    session_id: Optional[str] = None # Matches the optional nature
+    resolution: str
+
+
+#global_runner = InMemoryRunner(agent=root_agent) 
+
+
+@app.post("/triage", response_model=IncidentResolutionResponse)
 async def triage_incident(request: IncidentRequest):
-    """
-    API Endpoint to trigger the SRE agent via HTTP.
-    """
+    #API Endpoint to trigger the SRE agent via HTTP.
     try:
         runner = InMemoryRunner(agent=root_agent)
         final_text = ""
+
+        print("\n\n\n", "request.report: ", request.report, "\n\n\n")
+
+        # Prepare the user message in the required ADK format
+        user_message = Content(role="user", parts=[Part.from_text(text=request.report)])
+        print("\n\n\n", "user_message: ", user_message, "\n\n\n")
         
         # We use the same logic as your start_sre_session but capture output for JSON response
         async for event in runner.run_async(
             user_id=request.user_id,
             session_id=request.session_id,
-            new_message=request.report # Passing the string directly to ADK
+            new_message=user_message # Passing the string directly to ADK
         ):
             if event.content and event.content.parts:
+                print("\n\n\n", "event.content.parts: ", event.content.parts, "\n\n\n")
                 final_text += event.content.parts[0].text + "\n"
         
         return {
@@ -390,57 +456,98 @@ async def triage_incident(request: IncidentRequest):
         }
     except Exception as e:
         logger.error(f"API Error: {str(e)}")
-        raise HTTPException(status_status_code=500, detail=str(e))
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 import asyncio
 from google.adk.runners import Runner, InMemoryRunner
 from google.genai.types import Content, Part
+from google.adk.sessions import InMemorySessionService
 
+APP_NAME = "sre_app"
+session_service = InMemorySessionService()
+"""
 async def start_sre_session(initial_report: str):
     """
-    Orchestrates the agent using the ADK Runner to handle tool calls and events asynchronously.
-    """
+    #Orchestrates the SRE agent session using the ADK Runner.
+"""
+    # 1. Define consistent IDs
+    current_user = "sre_user_01"
+    current_session_id = "incident_001"
+
+    # 2. Pre-create the session in the service
+    session = await session_service.create_session(
+        app_name=APP_NAME, 
+        user_id=current_user, 
+        session_id=current_session_id
+    )
+    print(f"DEBUG: Successfully created Session ID: {session.id}")
     print(f"--- SRE AGENT SESSION STARTING ---")
     
-    runner = InMemoryRunner(agent=root_agent)
+    # 3. Initialize the standard Runner (v1.20+ requires both app_name and agent)
+    runner = Runner(
+        app_name=APP_NAME,
+        agent=root_agent, 
+        session_service=session_service
+    )
     
-    user_message = Content(role="user", parts=None)
     print(f"Incident: {initial_report}\n")
     
+    # 4. Prepare the initial message
+    user_message = Content(role="user", parts=[Part(text=initial_report)])
+    
     try:
+        # 5. Run the async event loop
         async for event in runner.run_async(
-            user_id="sre_user_01", 
-            session_id="incident_001", 
+            user_id=current_user,       # Must match session user_id
+            session_id=current_session_id, 
             new_message=user_message
         ):
-            
-            if event.content:
+            # Print content from the agent or tools
+            if event.content and event.content.parts:
                 print(f"[{event.author}]: {event.content.parts[0].text}")
             
+            # Check for final resolution event
             if event.is_final_response():
                 print("\n--- FINAL INCIDENT RESOLUTION ---")
-                print(event.content.parts[0].text)
-        
+                if event.content and event.content.parts:
+                    print(event.content.parts[0].text)
+
     except Exception as e:
-        print(f"\n[FATAL ERROR] System limit reached: {e}")
+        # This will catch 'Session not found' if IDs do not match
+        print(f"\n[FATAL ERROR] {e}")
+"""
 
-
-def start_api_server():
-    print("Starting FastAPI server on http://localhost:8000")
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+#def start_api_server():
+#    print("Starting FastAPI server on http://localhost:8000")
+#    uvicorn.run(app, host="0.0.0.0", port=8000)
 
 
 def main():
     print("Choose an option: (1) Run CLI simulation (2) Start API server")
-    # choice = input("Enter 1 or 2: ").strip()
+    #choice = input("Enter 1 or 2 or 3: ").strip()
     
-    choice = '1'
+    choice = '2'
     if choice == '1':
-        incident_trigger = "Given a decsription of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
-        asyncio.run(start_sre_session(incident_trigger))
+        #incident_trigger = "Given a decsription of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
+        #asyncio.run(start_sre_session(incident_trigger))
+        pass
     elif choice == '2':
-        start_api_server()
+        print("Starting SRE Agent on http://localhost:8000")
+        uvicorn.run(app, host="127.0.0.1", port=8000)
+    elif choice == '3':
+        # Start the metrics server on a specific port (e.g., 8000). This creates the /metrics endpoint at http://localhost:8000/metrics
+        """
+        start_http_server(8000, addr='0.0.0.0')
+        print("SRE Agent metrics server started on http://localhost:8000/metrics")
+
+        #Run the blocking agent session
+        incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
+        asyncio.run(start_sre_session(incident_trigger))
+        
+        # Keep running if needed
+        monitor_and_respond()
+        """
 
 if __name__ == "__main__":
     main()
