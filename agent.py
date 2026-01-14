@@ -11,12 +11,15 @@ from google import adk
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools.agent_tool import AgentTool
+from google.adk.tools import FunctionTool, ToolContext
 
 import asyncio
 from google.adk.runners import Runner
 from google.adk.runners import InMemoryRunner
 from google.genai.types import Content, Part
 from google.adk.sessions import InMemorySessionService
+from google.adk import types
+
 
 from fastapi import FastAPI, HTTPException
 from fastapi import Response, Request
@@ -34,18 +37,18 @@ from google.adk.cli.fast_api import get_fast_api_app
 
 SIMULATION_LOG_FILE = "service_simulation.log"
 
-INCIDENTS_RESOLVED = Counter('sre_agent_incidents_resolved_total', 'Total incidents handled by agent')
-AGENT_HEALTH = Gauge('sre_agent_health_status', 'Current health of the response agent (1=OK, 0=FAIL)')
-SRE_INCIDENTS_API = Counter('sre_incidents_total', 'Total incidents handled')
-
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("SRE-Main-Orchestrator")
 
+
 MODEL_NAME = os.getenv("SRE_MODEL_NAME", "ollama_chat/mistral-nemo:12b")
 SRE_MODEL = LiteLlm(model=MODEL_NAME, api_base="http://localhost:11434", num_ctx=4096)
+
+
+PROMETHEUS_METRIC_DIR = os.environ['PROMETHEUS_MULTIPROC_DIR']
 
 
 def fetch_telemetry_checkpoint(service_name: str) -> str:
@@ -132,27 +135,37 @@ def update_incident_timeline(event_description: str):
     return "TIMELINE_UPDATED"
 
 
-def request_human_approval(action: str, reasoning: str) -> str:
+def request_human_approval(action: str, reasoning: str, tool_context: types.ToolContext) -> str:
     """
-    Stops execution to ask a human operator for permission. 
-    Must be called BEFORE high-risk actions like service restarts or scaling.
-    """
-    print(f"\n[!!!] MANUAL APPROVAL REQUIRED: {action}")
-    print(f"[AGENT REASONING]: {reasoning}")
-    choice = input("Authorize execution? (yes/no): ").strip().lower()
-    return "APPROVED" if choice == "yes" else "DENIED_BY_OPERATOR"
-
-
-def request_human_approval(action: str, reasoning: str) -> str:
-    """
-    Stops execution to ask a human operator for permission in an ADK web environment.
+    Stops execution to ask a user for permission.
     This function should signal the ADK Runner to request user confirmation in the UI.
     Must be called BEFORE high-risk actions like service restarts or scaling
     It returns a status code that the agent interprets.
     """
-    print(f"\n[!!!] MANUAL APPROVAL REQUIRED: {action}")
-    print(f"[AGENT REASONING]: {reasoning}")
-    return f"APPROVAL_PENDING: Authorize '{action}'? (Reply 'yes' or 'no')"
+
+    confirmation_details = {
+        "action": action,
+        "reasoning": reasoning,
+        "timestamp": datetime.now().isoformat()
+    }
+
+    if not tool_context.tool_confirmation:
+        # Pause execution and request confirmation from the user/human
+        tool_context.request_confirmation(
+            hint="Please review the details before proceeding with the action.",
+            payload={"details": confirmation_details}
+        )
+        # Return a pending status or initial message
+        return {"status": "pending", "message": "Awaiting human approval"}
+    else:
+        # User has responded, proceed with the action using the confirmation payload
+        if tool_context.tool_confirmation.payload.get("approved"):
+            # Action approved
+            return {"status": "completed", "message": "Action approved by human, proceeding."}
+        else:
+            # Action rejected
+            return {"status": "rejected", "message": "Action rejected by human."}
+    return 
 
 
 def execute_infrastructure_action(service_name: str, action: str) -> str:
@@ -305,7 +318,7 @@ remediation_agent = Agent(
     If the user replies with 'no' or 'deny', **immediately stop** the remediation process and provide a final report stating that remediation was halted by the operator. 
     If the user replies with 'yes' or 'approve', proceed with the execution tool call.""",
     tools=[
-        request_human_approval, 
+        FunctionTool(request_human_approval, require_confirmation=True),
         execute_infrastructure_action, 
         verify_canary_health, 
         run_synthetic_probe, 
@@ -340,6 +353,7 @@ def transfer_to_triage():
     Use this when the root cause is unknown or data analysis is required.
     """
     return triage_agent
+
 
 def transfer_to_remediation():
     """Transfer to the RemediationAgent to apply fixes."""
@@ -396,7 +410,6 @@ from contextlib import asynccontextmanager
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # This runs ONCE when the worker starts
-    # Ideal for starting agents or background monitors
     incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
     asyncio.create_task(start_sre_session(incident_trigger))
     yield 
@@ -405,46 +418,37 @@ async def lifespan(app: FastAPI):
 # Create the main FastAPI application
 app = FastAPI(title="SRE Agent API", lifespan=lifespan)
 
-# Create the ADK App instance
-#adk_app_instance = App(name="incident_response", root_agent=root_agent)
+# Create a fresh registry for this request
+registry = CollectorRegistry()
+print("called CollectorRegistry...")
 
-# Mount the ADK app onto the main FastAPI app
-#app.mount("/adk", adk_app_instance.app) # Now 'mount' is a valid method on app
 
-# Create the main FastAPI application using the ADK helper
-# The helper function will automatically find my agent definitions in the file
-#app = get_fast_api_app()
+# Point it to the multiprocess directory
+mp = multiprocess.MultiProcessCollector(registry, path=PROMETHEUS_METRIC_DIR)
+print("_get_names:", registry._get_names(mp))
 
-# Mount prometheus metrics to the /metrics path
-#metrics_app = make_asgi_app() 
-#app.mount("/metrics", metrics_app) # Mount metrics to the main app
+
+INCIDENTS_RESOLVED = Counter('sre_agent_incidents_resolved', 'Total incidents handled by agent', registry=registry)
+AGENT_HEALTH = Gauge('sre_agent_health_status', 'Current health of the response agent (1=OK, 0=FAIL)', registry=registry)
+SRE_INCIDENTS_API = Counter('sre_incidents', 'Total incidents handled', registry=registry)
+#INCIDENTS_TRIAGED = Counter('sre_incidents_triaged', 'Total incidents triaged')
 
 
 @app.get("/metrics")
 def metrics():
-    # Create a fresh registry for this request
-    registry = CollectorRegistry()
-
-    # Point it to the multiprocess directory
-    multiprocess.MultiProcessCollector(registry, path="../prometheus_multiprocess/")
-    
+  
+    print("hello")
     # Generate metrics from all workers' shared files
     data = generate_latest(registry)
+    print("goodbye")
     
-    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    return #Response(content=data, media_type=CONTENT_TYPE_LATEST)
+
 
 @app.get("/")
 async def root():
     SRE_INCIDENTS_API.inc()
-    return {"message": "SRE Agent API is Running"}
-
-
-'''
-class IncidentRequest(BaseModel):
-    report: str
-    user_id: str = "sre_user_01"
-    session_id: str = str(uuid.uuid4())
-'''
+    return {"message": "SRE Agent API is Running", "desc": "give an incident and the agent system will triage it"}
 
 
 from enum import Enum
@@ -455,123 +459,152 @@ class Severity(str, Enum):
     sev2 = "SEV-2"
     sev3 = "SEV-3"
 
-class IncidentRequest(BaseModel):
-    title: str = Field(...)
-    severity: Severity = Field(..., description="The impact level of the incident")
-    service_name: str = Field(...)
-    #reporter: str = Field(...)
-    description: str = Field(None, description="Detailed symptoms and steps to reproduce")
-
-
-class IncidentResolutionResponse(BaseModel):
-    status: str
-    session_id: Optional[str] = None # Matches the optional nature
-    resolution: str
-
-
-#global_runner = InMemoryRunner(agent=root_agent) 
 
 APP_NAME = "sre_app"
-session_service = InMemorySessionService()
+sessionservice = InMemorySessionService()
+sessionservice.app_name = APP_NAME
 
-current_user = "sre_user_01"
-current_session_id = "incident_001"
+
+SHARED_USER_ID = "sre_agent_system"
+SHARED_SESSION_ID = f"INC-{uuid.uuid4().hex[:8].upper()}"
+
 
 runner = Runner(
     app_name=APP_NAME,
     agent=root_agent, 
-    session_service=session_service
+    session_service=sessionservice
 )
 
 
-@app.post("/triage", response_model=IncidentResolutionResponse)
+class Incident(BaseModel):
+    id: str = Field(..., description="Unique incident ID (e.g., INC-12345)")
+    title: str = Field(..., description="A brief summary of the issue")
+    service_id: str = Field(..., description="The affected service or application")
+    status: str = Field(..., description="Current status (e.g., 'triggered', 'investigating', 'resolved', 'closed')")
+    severity: str = Field(..., description="Severity level (e.g., 'critical', 'high', 'medium', 'low')")
+    trigger_time: datetime = Field(..., description="When the incident was first detected/triggered")
+    description: Optional[str] = Field(..., description="Detailed description of symptoms/observations")
+    source: str = Field(..., description="How the incident was created (e.g., 'monitoring_alert', 'user_report', 'manual')")
+    assignee: Optional[str] = Field(..., description="The person or team currently responsible")
+    mttr: Optional[float] = Field(..., description="Mean Time To Resolve (for metrics)")
+    playbook_uri: Optional[str] = Field(..., description="Link to the relevant runbook/playbook")
+    related_alerts: Optional[List[str]] = Field(..., description="List of associated alert IDs")
+
+
+class IncidentRequest(BaseModel):
+    """
+    Input model for the SRE Triage Agent, containing raw incident details.
+    """
+    incident_id: str = Field(..., description="Unique identifier for the incident.")
+    title: str = Field(..., description="A brief summary of the incident.")
+    description: str = Field(..., description="Detailed description of the problem, symptoms, and impact.")
+    source_system: str = Field(..., description="The monitoring tool or system that generated the alert (e.g., Prometheus, PagerDuty, Datadog).")
+    timestamp_utc: datetime = Field(..., description="The time the incident was recorded in UTC.")
+    service_affected: str = Field(..., description="The name of the primary service, application, or component experiencing the issue.")
+    severity_level: Optional[str] = Field(None, description="Initial perceived severity (e.g., SEV1, SEV2), if available from the source system.")
+    logs_url: Optional[str] = Field(None, description="URL linking to relevant logs for investigation.")
+    metrics_url: Optional[str] = Field(None, description="URL linking to relevant metrics dashboards for performance analysis.")
+    playbook_url: Optional[str] = Field(None, description="URL to the existing runbook or playbook for this service, if one exists.")
+
+
+class IncidentTriageResponse(BaseModel):
+    """
+    Output model for the SRE Triage Agent's analysis.
+    """
+    incident_id: str = Field(..., description="Unique identifier for the incident, linked back to the input.")
+    classification: str = Field(..., description="The agent's classification of the incident type (e.g., 'Latency Spike', 'Error Rate Increase', 'Service Unavailability').")
+    priority: str = Field(..., description="The agent's assessed priority level (e.g., P0, P1, P2).")
+    recommended_action: str = Field(..., description="The immediate recommended next step (e.g., 'Run diagnostics script', 'Escalate to networking team', 'Initiate automated restart').")
+    confidence_score: float = Field(..., description="A score from 0.0 to 1.0 indicating the agent's confidence in its triage result.")
+    is_automated_remediation_possible: bool = Field(..., description="Indicates if the agent believes the issue can be resolved with existing automation tools.")
+
+
+@app.post("/triage", response_model=IncidentTriageResponse)
 async def triage_incident(request: IncidentRequest):
-    #API Endpoint to trigger the SRE agent via HTTP.
+    """
+    API Endpoint to trigger the SRE agent via HTTP.
+    Converts raw incident details into a structured triage response.
+    """
+    print(f"DEBUG: Endpoint SessionService ID: {id(sessionservice)}")
+    print(f"DEBUG: Runner SessionService ID: {id(runner.session_service)}")
+    
+    if id(sessionservice) == id(runner.session_service):
+        print("SUCCESS: They are using the same instance.")
+    else:
+        print("ERROR: Instances do not match. Runner cannot find the session created by the endpoint.")
+
+
     try:
+        # Manage Session State
         try:
-            # Try to get the existing session
-            
-            '''await session_service.get_session(
+            await sessionservice.get_session(
                 app_name=APP_NAME, 
-                user_id=request.user_id, 
-                session_id=request.session_id
-            )'''
-
-            await session_service.get_session(
-                app_name=APP_NAME, 
-                user_id=current_user, 
-                session_id=current_session_id
+                user_id=SHARED_USER_ID, # System-level ID for automated triage
+                session_id=SHARED_SESSION_ID
             )
-        except ValueError:
-            # If not found, create a new one (note: create_session is an async function)
-            '''await session_service.create_session(
+        except Exception:
+            await sessionservice.create_session(
                 app_name=APP_NAME, 
-                user_id=request.user_id, 
-                session_id=request.session_id
-            )'''
-
-            await session_service.create_session(
-                app_name=APP_NAME, 
-                user_id=current_user, 
-                session_id=current_session_id
+                user_id=SHARED_USER_ID, 
+                session_id=SHARED_SESSION_ID
             )
-        
-        final_text = ""
 
-        print("\n\n\n", "request.report: ", request.report, "\n\n\n")
+            await asyncio.sleep(1) 
 
-        # Prepare the user message in the required ADK format
-        user_message = Content(role="user", parts=[Part.from_text(text=request.report)])
-        print("\n\n\n", "user_message: ", user_message, "\n\n\n")
         
-        # We use the same logic as your start_sre_session but capture output for JSON response
+        # Process Incident via Agent Runner
+        # Pass the description and title as the core context for analysis
+        final_analysis = ""
+        user_message = Content(role="user", parts=[Part.from_text(text=request.description)])
+        
         async for event in runner.run_async(
-            user_id=request.user_id,
-            session_id=request.session_id,
-            new_message=user_message # Passing the string directly to ADK
+            user_id=SHARED_USER_ID,
+            session_id=SHARED_SESSION_ID,
+            new_message=user_message
         ):
             if event.content and event.content.parts:
-                print("\n\n\n", "event.content.parts: ", event.content.parts, "\n\n\n")
-                final_text += event.content.parts[0].text + "\n"
-        
-        return {
-            "status": "completed",
-            "session_id": request.session_id,
-            "resolution": final_text.strip()
-        }
-    except Exception as e:
-        logger.error(f"API Error: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
+                ##part_text = event.content.parts[0].text if isinstance(event.content.parts, list) else event.content.parts.text
+                part_text = getattr(event.content.parts, 'text', "")
+                if part_text:
+                    print(f"API AGENT: {part_text}")
+                    final_analysis += part_text
+                #final_analysis += event.content.parts[0].text
+                
 
+        # Parse and Map to IncidentTriageResponse
+        # In a production scenario, I would use a structured LLM output (like JSON mode) to map these fields accurately.
+        return IncidentTriageResponse(
+            incident_id=SHARED_SESSION_ID,
+            classification="Service Unavailability", # Derived from analysis
+            priority="P0" if request.severity_level == "SEV1" else "P1",
+            recommended_action="Initiate automated restart of " + request.service_affected,
+            confidence_score=0.95,
+            is_automated_remediation_possible=True
+        )
+
+    except Exception as e:
+        logger.error(f"Triage Error for {SHARED_SESSION_ID}: {str(e)}")
+        raise HTTPException(
+            status_code=500, 
+            detail=f"Failed to triage incident: {str(e)}"
+        )
+    
 
 async def start_sre_session(initial_report: str):
     '''
     Orchestrates the SRE agent session using the ADK Runner.
     '''
-    """
-    # Define consistent IDs
-    current_user = "sre_user_01"
-    current_session_id = "incident_001"
-    """
-
     # Pre-create the session in the service
-    session = await session_service.create_session(
+    session = await sessionservice.create_session(
         app_name=APP_NAME, 
-        user_id=current_user, 
-        session_id=current_session_id
+        user_id=SHARED_USER_ID, 
+        session_id=SHARED_SESSION_ID
     )
     print(f"DEBUG: Successfully created Session ID: {session.id}")
     print(f"--- SRE AGENT SESSION STARTING ---")
     
     # Initialize the standard Runner (v1.20+ requires both app_name and agent)
     global runner
-    """
-    runner = Runner(
-        app_name=APP_NAME,
-        agent=root_agent, 
-        session_service=session_service
-    )
-    """
     
     print(f"Incident: {initial_report}\n")
     
@@ -581,11 +614,12 @@ async def start_sre_session(initial_report: str):
     try:
         # Run the async event loop
         async for event in runner.run_async(
-            user_id=current_user,       # Must match session user_id
-            session_id=current_session_id, 
+            user_id=SHARED_USER_ID,       # Must match session user_id
+            session_id=SHARED_SESSION_ID, 
             new_message=user_message
         ):
             # Print content from the agent or tools
+            #if not event.is_final_response():
             if event.content and event.content.parts:
                 print(f"[{event.author}]: {event.content.parts[0].text}")
             
@@ -614,9 +648,6 @@ def main():
         incident_trigger = "Given a decsription of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
         asyncio.run(start_sre_session(incident_trigger))
     elif choice == '2':
-        #incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
-        #start_sre_session(incident_trigger)
-
         print("Starting FastAPI server on http://localhost:8000")
         uvicorn.run("agent:app", host="0.0.0.0", port=8000, workers=4)
     elif choice == '3':
