@@ -1,1 +1,3 @@
 .venv
+incident_response/__pycache__
+incident_response/tools/__pycache__

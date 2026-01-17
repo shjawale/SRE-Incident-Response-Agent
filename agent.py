@@ -18,7 +18,6 @@ from google.adk.runners import Runner
 from google.adk.runners import InMemoryRunner
 from google.genai.types import Content, Part
 from google.adk.sessions import InMemorySessionService
-from google.adk import types
 
 
 from fastapi import FastAPI, HTTPException
@@ -135,7 +134,7 @@ def update_incident_timeline(event_description: str):
     return "TIMELINE_UPDATED"
 
 
-def request_human_approval(action: str, reasoning: str, tool_context: types.ToolContext) -> str:
+def request_human_approval(action: str, reasoning: str, tool_context: ToolContext) -> str:
     """
     Stops execution to ask a user for permission.
     This function should signal the ADK Runner to request user confirmation in the UI.
@@ -183,7 +182,17 @@ def verify_canary_health(service_name: str) -> str:
     Verifies system stability after a fix has been applied. 
     Checks if error rates have dropped below 1%.
     """
-    return "### CANARY VERIFICATION\n- Result: PASSED\n- Observation: Traffic stabilized, errors < 1%."
+    error_rate = random.uniform(0, 0.05)  # Simulate error rate between 0% and 5%
+
+    # Determine canary verification result
+    if error_rate < 0.01:
+        result = "PASSED"
+        observation = f"Traffic stabilized, errors {error_rate:.2%} < 1%."
+    else:
+        result = "FAILED"
+        observation = f"Error rate too high: {error_rate:.2%}."
+
+    return "### CANARY VERIFICATION FOR {service_name.upper()}\nResult: {result}\nObservation: {observation}\n"
 
 
 def send_external_notification(channel: str, message: str) -> str:
@@ -389,6 +398,16 @@ root_agent = SequentialAgent(
 )
 
 
+'''
+    sub_agents=[
+        triage_agent, 
+        runbook_agent,
+        remediation_agent,
+        postmortem_agent,
+        status_update_agent
+    ]
+'''
+
 ## Prometheus
 def monitor_and_respond():
     """
@@ -403,6 +422,37 @@ def monitor_and_respond():
             INCIDENTS_RESOLVED.inc()
         
         time.sleep(5)
+
+
+
+def monitor_and_respond():
+    """
+    Main loop for Prometheus to monitor the SRE agents and accept manual incident input from the operator.
+    """
+    AGENT_HEALTH.set(1)  # Mark agent as healthy
+
+    while True:
+        try:
+            # Prompt operator for incident description
+            incident_trigger = input(
+                "Waiting for incident input from operator...\nEnter incident description: "
+            ).strip()
+
+            if incident_trigger:
+                print("Incident received. Processing...")
+                INCIDENTS_RESOLVED.inc()
+
+                # Here you can trigger your SRE session
+                # asyncio.run(start_sre_session(incident_trigger))
+                # or add it to a queue for async processing
+
+            # Short pause before next prompt
+            time.sleep(5)
+
+        except KeyboardInterrupt:
+            print("\nShutting down monitor loop.")
+            break
+
 
 
 from contextlib import asynccontextmanager
@@ -436,13 +486,12 @@ SRE_INCIDENTS_API = Counter('sre_incidents', 'Total incidents handled', registry
 
 @app.get("/metrics")
 def metrics():
-  
     print("hello")
     # Generate metrics from all workers' shared files
     data = generate_latest(registry)
     print("goodbye")
     
-    return #Response(content=data, media_type=CONTENT_TYPE_LATEST)
+    return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
 
 @app.get("/")
@@ -643,7 +692,7 @@ def main():
     print("Choose an option: (1) Run CLI simulation (2) Start API server")
     #choice = input("Enter 1 or 2 or 3: ").strip()
     
-    choice = '2'
+    choice = '3'
     if choice == '1':
         incident_trigger = "Given a decsription of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
         asyncio.run(start_sre_session(incident_trigger))
@@ -656,9 +705,11 @@ def main():
         print("SRE Agent metrics server started on http://localhost:8000/metrics")
 
         #Run the blocking agent session
-        incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
+        #incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
+        incident_trigger ="A portion of application traffic failed due to DNS resolution errors caused by misconfigured VPC, DNS, and security group changes that blocked outbound DNS traffic, affecting instances in a specific private subnet using AWS-provided DNS. Monitoring data and flow logs confirmed the failures aligned with recent configuration changes that incorrectly routed or denied DNS traffic, despite no regional AWS outage being reported."
         asyncio.run(start_sre_session(incident_trigger))
-        
+        print("now call monitor_and_respond()\n\n")
+
         # Keep running if needed
         monitor_and_respond()
         
