@@ -20,10 +20,16 @@ from google.genai.types import Content, Part
 from google.adk.sessions import InMemorySessionService
 
 
+from google.adk.tools.mcp_tool import McpToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+
+
 from fastapi import FastAPI, HTTPException
 from fastapi import Response, Request
 from pydantic import BaseModel
 import uvicorn
+
 
 from prometheus_client import make_asgi_app, Counter
 from prometheus_client import Gauge, generate_latest, CONTENT_TYPE_LATEST
@@ -36,6 +42,9 @@ from google.adk.cli.fast_api import get_fast_api_app
 
 SIMULATION_LOG_FILE = "service_simulation.log"
 
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SRE_INCIDENTS_DB = "sre_incidents.db"
+RUNBOOK_MCP_SERVER = os.path.join(CURRENT_DIR, "tools/runbook_mcp_server.py")
 
 load_dotenv()
 
@@ -129,7 +138,8 @@ def update_incident_timeline(event_description: str):
     """
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     entry = f"[{timestamp}] {event_description}\n"
-    with open("incident_timeline.txt", "a") as f:
+    file_path = os.path.join(CURRENT_DIR, "incident_timeline.txt")
+    with open(file_path, "a") as f:
         f.write(entry)
     return "TIMELINE_UPDATED"
 
@@ -292,13 +302,11 @@ triage_agent = Agent(
     name='TriageAgent',
     model=SRE_MODEL,
     instruction="""Analyze incident data. Identify root causes. Keep reports factual and brief.
-    gather and analyze incident data for handoff to runbook creation. 
+    Gather and analyze incident data for handoff to runbook creation. 
     Create a short incident report. Identify the core technical issues. 
-    Acknowledge missing data and if needed, ask specific technical questions before attempting a transfer. """,
+    Acknowledge missing data and if needed, ask specific technical questions before attempting a transfer.""",
     tools=[
-        query_historical_incidents, 
         analyze_stack_trace, 
-        suggest_runbook_steps,
         generate_mock_logs, 
         analyze_large_logs_for_patterns
     ],
@@ -306,13 +314,68 @@ triage_agent = Agent(
 )
 
 
+knowlege_agent = Agent(
+    name = 'KnowledgeAgent',
+    model = SRE_MODEL,
+    instruction="""You will use the triaged report from TriageAgent agent to create a query to the runbooks database.
+    Then call search_runbooks with the query to find the most similar past runbooks to the current incident. 
+    Finally, either return the incident_id and title of the runbook that matches the best for the next agent or a clear message you did not find a matching runbook.""",
+    tools=[
+        McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="python3",
+                    args=[RUNBOOK_MCP_SERVER]
+                )
+            ),
+            tool_filter=["search_runbooks"]
+        ),
+        suggest_runbook_steps
+    ],
+    output_key="foundrunbooks"
+)
+
+
 runbook_agent = Agent(
     name = 'RunbookAgent',
     model = SRE_MODEL,
     instruction="""You are a specialized report creating agent. 
-    Your only job is to take the triaged incident report and create a suggested runbook that is clearly labeled. 
+    First check the output from KnowledgeAgent to see if it found the most similar past runbooks to the current incident. 
+    If KnowledgeAgent found a past runbook, use get_runbook_from_id tool to return its content.
+    If KnowledgeAgent has not found a runbook, take the triaged incident report and create a suggested runbook that is clearly labeled.
     This is for internal use within the company.""",
+    tools=[
+        McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="python3",
+                    args=[RUNBOOK_MCP_SERVER]
+                )
+            ),
+            tool_filter=["get_runbook_from_id"]
+        ),
+        suggest_runbook_steps
+    ],
     output_key="runbooks",
+)
+
+
+persistence_agent = Agent(
+    name="RunbookPersistenceAgent",
+    instruction="""Save the runbook provided by the previous agent to the database using your save_runbook tool. 
+    The incident_id should be the same as the SHARED_SESSION_ID.
+    Include a short clear title that functions as a label for the the incident for easy fetching later.""",
+    tools=[
+        McpToolset(
+            connection_params=StdioConnectionParams(
+                server_params=StdioServerParameters(
+                    command="python3",
+                    args=[RUNBOOK_MCP_SERVER]
+                )
+            ),
+            tool_filter=["save_runbook"]
+        )
+    ]
 )
 
 
@@ -356,6 +419,90 @@ status_update_agent = Agent(
 )
 
 
+
+# Database setup using SQLModel
+from sqlmodel import Field, SQLModel, create_engine, Session, select
+from google.adk.tools.mcp_tool import MCPToolset  # Use MCPToolset
+from google.adk.tools.mcp_tool.mcp_session_manager import StdioConnectionParams
+from mcp import StdioServerParameters
+
+# Define a schema (e.g., Incident tracking)
+class IncidentRecord(SQLModel, table=True):
+    id: Optional[int] = Field(default=None, primary_key=True)
+    service: str
+    status: str
+    timestamp: datetime = Field(default_factory=datetime.now)
+
+#sqlite_url = "sqlite://" + os.path.join(CURRENT_DIR, "sre_incidents.db")
+sqlite_url = "sqlite:///incident_response/sre_incidents.db"
+engine = create_engine(sqlite_url)
+
+def init_db():
+    SQLModel.metadata.create_all(engine)
+
+# Database logic to be used as a Tool
+def log_incident_to_db(service: str, status: str) -> str:
+    """Persists incident status into the SQL database."""
+    with Session(engine) as session:
+        incident = IncidentRecord(service=service, status=status)
+        session.add(incident)
+        session.commit()
+        return f"Database updated: {service} set to {status}"
+
+
+MCP_DATA_PATH = os.path.join(CURRENT_DIR, "mcp_data")
+
+mcp_toolset = McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="/usr/bin/npx",
+            args=[
+                "-y", 
+                "@modelcontextprotocol/server-filesystem", 
+                MCP_DATA_PATH,
+            ],
+            env=os.environ.copy(), # Crucial: ensures the subprocess sees Node/NPM
+            input=None,
+        ),
+        timeout=300 # Optional: Increase timeout for slow-starting servers
+    )
+)
+
+
+# Initialize DB before starting
+#init_db()
+
+# Your Orchestrator Agent
+mcp_agent = Agent(
+    name="mcp_orchestrator",
+    model=SRE_MODEL,
+    instruction="""
+        You have access to a local filesystem via MCP tools.
+    
+        CRITICAL: The ONLY authorized directory for file operations is: MCP_DATA_PATH
+    
+        When you need to list files or read logs, ALWAYS use this exact path. 
+        Do not ask the user for a path; it is already defined as MCP_DATA_PATH
+
+        Use log_incident_to_db to update the SQL database with incident runbooks.
+    """,
+    tools=[
+        mcp_toolset,           # Adds all tools from the MCP server
+        log_incident_to_db,    # Adds your SQLModel function
+    ]
+)
+
+'''
+async def get_mcp_tools():
+    # Connecting to a local SQLite MCP server
+    params = StdioServerParameters(
+        command="uv",
+        args=["run", "mcp-server-sqlite", "--db-path", "sre_history.db"]
+    )
+    mcp_toolset = await McpToolset.from_stdio(params)
+    return mcp_toolset.get_tools()
+'''
+
 def transfer_to_triage():
     """
     EXECUTE IMMEDIATELY to transfer control to the TriageAgent. 
@@ -390,7 +537,9 @@ root_agent = SequentialAgent(
     """,
     sub_agents=[
         triage_agent, 
+        knowlege_agent,
         runbook_agent,
+        persistence_agent,
         remediation_agent,
         postmortem_agent,
         status_update_agent
@@ -398,33 +547,7 @@ root_agent = SequentialAgent(
 )
 
 
-'''
-    sub_agents=[
-        triage_agent, 
-        runbook_agent,
-        remediation_agent,
-        postmortem_agent,
-        status_update_agent
-    ]
-'''
-
 ## Prometheus
-def monitor_and_respond():
-    """
-    Main loop for Prometheus to monitor the SRE agents
-    """
-    AGENT_HEALTH.set(1) # Mark agent as healthy
-    
-    while True:
-        # Simulate incident detection and response
-        if random.random() > 0.8:
-            print("Incident detected! Automating response...")
-            INCIDENTS_RESOLVED.inc()
-        
-        time.sleep(5)
-
-
-
 def monitor_and_respond():
     """
     Main loop for Prometheus to monitor the SRE agents and accept manual incident input from the operator.
@@ -439,7 +562,7 @@ def monitor_and_respond():
             ).strip()
 
             if incident_trigger:
-                print("Incident received. Processing...")
+                import sys; print("Incident received. Processing...", file=sys.stderr)
                 INCIDENTS_RESOLVED.inc()
 
                 # Here you can trigger your SRE session
@@ -450,7 +573,7 @@ def monitor_and_respond():
             time.sleep(5)
 
         except KeyboardInterrupt:
-            print("\nShutting down monitor loop.")
+            import sys; print("\nShutting down monitor loop.", file=sys.stderr)
             break
 
 
@@ -486,10 +609,10 @@ SRE_INCIDENTS_API = Counter('sre_incidents', 'Total incidents handled', registry
 
 @app.get("/metrics")
 def metrics():
-    print("hello")
+    import sys; print("hello", file=sys.stderr)
     # Generate metrics from all workers' shared files
     data = generate_latest(registry)
-    print("goodbye")
+    import sys; print("goodbye", file=sys.stderr)
     
     return Response(content=data, media_type=CONTENT_TYPE_LATEST)
 
@@ -574,13 +697,13 @@ async def triage_incident(request: IncidentRequest):
     API Endpoint to trigger the SRE agent via HTTP.
     Converts raw incident details into a structured triage response.
     """
-    print(f"DEBUG: Endpoint SessionService ID: {id(sessionservice)}")
-    print(f"DEBUG: Runner SessionService ID: {id(runner.session_service)}")
+    import sys; print(f"DEBUG: Endpoint SessionService ID: {id(sessionservice)}", file=sys.stderr)
+    import sys; print(f"DEBUG: Runner SessionService ID: {id(runner.session_service)}", file=sys.stderr)
     
     if id(sessionservice) == id(runner.session_service):
-        print("SUCCESS: They are using the same instance.")
+        import sys; print("SUCCESS: They are using the same instance.", file=sys.stderr)
     else:
-        print("ERROR: Instances do not match. Runner cannot find the session created by the endpoint.")
+        import sys; print("ERROR: Instances do not match. Runner cannot find the session created by the endpoint.", file=sys.stderr)
 
 
     try:
@@ -615,7 +738,7 @@ async def triage_incident(request: IncidentRequest):
                 ##part_text = event.content.parts[0].text if isinstance(event.content.parts, list) else event.content.parts.text
                 part_text = getattr(event.content.parts, 'text', "")
                 if part_text:
-                    print(f"API AGENT: {part_text}")
+                    import sys; print(f"API AGENT: {part_text}", file=sys.stderr)
                     final_analysis += part_text
                 #final_analysis += event.content.parts[0].text
                 
@@ -639,57 +762,54 @@ async def triage_incident(request: IncidentRequest):
         )
     
 
+def start_api_server():
+    import sys; print("Starting FastAPI server on http://localhost:8000", file=sys.stderr)
+    uvicorn.run("agent:app", host="127.0.0.1", port=8000, workers=4)
+
+
+import asyncio
+from prometheus_client import start_http_server
+
 async def start_sre_session(initial_report: str):
     '''
     Orchestrates the SRE agent session using the ADK Runner.
     '''
-    # Pre-create the session in the service
+    # Initialize session
     session = await sessionservice.create_session(
         app_name=APP_NAME, 
         user_id=SHARED_USER_ID, 
         session_id=SHARED_SESSION_ID
     )
-    print(f"DEBUG: Successfully created Session ID: {session.id}")
-    print(f"--- SRE AGENT SESSION STARTING ---")
     
-    # Initialize the standard Runner (v1.20+ requires both app_name and agent)
-    global runner
-    
-    print(f"Incident: {initial_report}\n")
-    
-    # Prepare the initial message
+    import sys; print(f"DEBUG: Successfully created Session ID: {session.id}", file=sys.stderr)
+    import sys; print(f"--- SRE AGENT SESSION STARTING ---", file=sys.stderr)
+    import sys; print(f"Incident: {initial_report}\n", file=sys.stderr)
+
     user_message = Content(role="user", parts=[Part(text=initial_report)])
     
     try:
-        # Run the async event loop
+        # Run the async event loop via the ADK Runner
         async for event in runner.run_async(
-            user_id=SHARED_USER_ID,       # Must match session user_id
+            user_id=SHARED_USER_ID,
             session_id=SHARED_SESSION_ID, 
             new_message=user_message
         ):
-            # Print content from the agent or tools
             #if not event.is_final_response():
             if event.content and event.content.parts:
-                print(f"[{event.author}]: {event.content.parts[0].text}")
-            
-            # Check for final resolution event
+                import sys; print(f"[{event.author}]: {event.content.parts[0].text}", file=sys.stderr)
+
             if event.is_final_response():
-                print("\n--- FINAL INCIDENT RESOLUTION ---")
+                import sys; print("\n--- FINAL INCIDENT RESOLUTION ---", file=sys.stderr)
                 if event.content and event.content.parts:
-                    print(event.content.parts[0].text)
+                    import sys; print(event.content.parts[0].text, file=sys.stderr)
 
     except Exception as e:
-        # This will catch 'Session not found' if IDs do not match
-        print(f"\n[FATAL ERROR] {e}")
+        import sys; print(f"\n[FATAL ERROR] {e}", file=sys.stderr)
 
 
-def start_api_server():
-    print("Starting FastAPI server on http://localhost:8000")
-    uvicorn.run("agent:app", host="127.0.0.1", port=8000, workers=4)
 
-
-def main():
-    print("Choose an option: (1) Run CLI simulation (2) Start API server")
+async def main():
+    import sys; print("Choose an option: (1) Run CLI simulation (2) Start API server", file=sys.stderr)
     #choice = input("Enter 1 or 2 or 3: ").strip()
     
     choice = '3'
@@ -700,19 +820,19 @@ def main():
         print("Starting FastAPI server on http://localhost:8000")
         uvicorn.run("agent:app", host="0.0.0.0", port=8000, workers=4)
     elif choice == '3':
-        # Start the metrics server on a specific port (e.g., 8000). This creates the /metrics endpoint at http://localhost:8000/metrics
-        start_http_server(8000, addr='0.0.0.0')
-        print("SRE Agent metrics server started on http://localhost:8000/metrics")
+        mcp_tools = mcp_toolset.get_tools()
+        #mcp_agent.tools.extend(mcp_tools)
+        persistence_agent.tools.extend(mcp_tools)
 
-        #Run the blocking agent session
-        #incident_trigger = "Given a description of a DevOps or SRE incident, triage it, suggest runbooks for it, start remediation. After the incident has been resolved, create a postmortem report and a formatted update post."
-        incident_trigger ="A portion of application traffic failed due to DNS resolution errors caused by misconfigured VPC, DNS, and security group changes that blocked outbound DNS traffic, affecting instances in a specific private subnet using AWS-provided DNS. Monitoring data and flow logs confirmed the failures aligned with recent configuration changes that incorrectly routed or denied DNS traffic, despite no regional AWS outage being reported."
-        asyncio.run(start_sre_session(incident_trigger))
-        print("now call monitor_and_respond()\n\n")
-
-        # Keep running if needed
-        monitor_and_respond()
+        async with mcp_toolset:
+            app = App(agents=[root_agent], name="sre_app")
+            # If running via CLI/FastAPI:
+            # uvicorn.run(get_fast_api_app(app), host="0.0.0.0", port=8000)
+            
+            # Or running a direct query:
+            response = await root_agent.run("Check the logs via MCP and log a 'critical' status to the DB for service 'payment-gateway'")
+            import sys; print(response.text, file=sys.stderr)
         
         
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
