@@ -59,17 +59,21 @@ These examples illustrate typical incident lifecycles handled by the SRE Inciden
 
 2. **Triage**: TriageAgent analyzes the data and identifies a misconfigured cache.
 
-3. **Runbook Generation**: RunbookAgent generates a mitigation runbook recommending a cache reset.
+3. **Knowledge**: KnowledgeAgent queries the MCP database to find similar historical incidents and known fixes.
 
-4. **Remediation**:
+4. **Runbook Generation**: RunbookAgent generates a mitigation runbook recommending a cache reset.
+
+5. **Persistence**: PersistenceAgent generates a unique incident ID and saves any newly created runbooks back to the SQL database.
+
+6. **Remediation**:
 
    * Action classified as low-risk → auto-approved.
 
    * RemediationAgent resets the cache automatically.
 
-5. **Verification**: System metrics confirm latency normalized.
+7. **Verification**: System metrics confirm latency normalized.
 
-6. **Closure**: Incident is marked resolved; postmortem report archived.
+8. **Closure**: Incident is marked resolved; postmortem report archived.
 
 Key Points: No human approval required; timeline fully logged for audit.
 
@@ -79,9 +83,13 @@ Key Points: No human approval required; timeline fully logged for audit.
 
 2. **Triage**: TriageAgent identifies a misconfigured database failover as the root cause.
 
-3. **Runbook Generation**: RunbookAgent produces a mitigation runbook with high-risk actions (e.g., manual failover).
+3. **Knowledge**: KnowledgeAgent queries the internal documentation and past incident logs to identify existing runbooks or similar historical failure patterns.
 
-4. **Remediation**:
+4. **Runbook Generation**: RunbookAgent produces a mitigation runbook with high-risk actions (e.g., manual failover).
+
+5. **Persistence**: RunbookPersistenceAgent saves the newly generated or modified runbook to the database with a unique incident ID and a clear title for future reference.
+
+6. **Remediation**:
 
     * High-risk action → requires operator approval.
 
@@ -89,18 +97,20 @@ Key Points: No human approval required; timeline fully logged for audit.
 
     * Operator reviews and approves execution.
 
-5. **Execution**: Action is performed; agent validates database integrity.
+7. **Execution**: Action is performed; agent validates database integrity.
 
-6. **Verification & Closure**: Stability confirmed, stakeholders notified, postmortem compiled.
+8. **Verification & Closure**: Stability confirmed, stakeholders notified, postmortem compiled.
 
 Key Points: HITL ensures operational safety; all decisions logged for compliance.
 
 
 ## Agent Roles
-| Agent          |    Purpose
------------------|:---------------------
-| TriageAgent    |  Analyzes incident data, identifies core issues, and flags data gaps.
-| RunbookAgent   |  Generates internal suggested runbooks for the engineering review.
+| Agent           |    Purpose
+------------------|:---------------------
+| TriageAgent     |  Analyzes incident data, identifies core issues, and flags data gaps.
+| Knowledge Agent |  Queries the MCP Runbook database for historical fixes.
+| RunbookAgent    |  Generates internal suggested runbooks for the engineering review.
+| Persistence Agent | Ensures new runbooks are saved to the DB for future use.
 | RemediationAgent |  Proposes fixes and actions, distinguishing between auto-tasks and manual rollbacks.
 | PostmortemAgent  |  Compiles final internal post-incident reports and root cause analysis.
 | StatusUpdateAgent  |  Formats status updates for both internal teams and external stakeholders.
@@ -131,11 +141,57 @@ No further actions are taken while approval remains unresolved.
 The Human-in-the-Loop design enables controlled automation while preserving the reliability and governance standards required for production SRE operations.
 
 
+## Model Context Protocol Runbook Server
+Certain agents leverage a dedicated Model Context Protocol (MCP) Server to bridge the gap between the LLM and the runbooks database. This allows for standardized, secure, and context-rich tool execution. 
+
+### Knowledge Retrieval & Persistence
+
+   * ```search_runbooks```: Performs semantic search across historical incident records to find the most relevant past resolutions based on the current triage report.
+   * ```save_runbook```: Automatically persists newly generated mitigation plans if no existing runbook matches the current incident.
+   * Standardized Interface: Uses a unified protocol to interact with the SQLite backend, ensuring consistent data formatting and reducing the risk of SQL injection. 
+
+### Configuration & Toolset
+The orchestrator connects to the server via ```StdioConnectionParams```. Ensure the ```RUNBOOK_MCP_SERVER``` path points to the correct script in your environment:
+
+```
+McpToolset(
+    connection_params=StdioConnectionParams(
+        server_params=StdioServerParameters(
+            command="python3",
+            args=[RUNBOOK_MCP_SERVER]        # should point to tools/runbook_mcp_server.py
+        )
+    ),
+    tool_filter=["save_runbook"]
+)
+```
+
+### Potential Extensions
+   * Cross-Service Indexing: Scale the server to index runbooks across multiple git repositories or Confluence spaces using MCP-compatible connectors.
+   * Vector Search: Integrate a vector database (e.g., ChromaDB or Pinecone) into the MCP server for advanced RAG-based similarity matching.
+   * Schema Enforcement: Add strict Pydantic validation to the MCP tools to ensure all saved runbooks follow a mandatory "Symptoms/Fix/Verification" structure.
+
+
+## Agent Governance & Safety
+This orchestrator follows strict SRE "Human-in-the-Loop" (HITL) principles to prevent rogue automation and ensure blameless accountability.
+
+### Implemented Guardrails
+   * Mandatory Approval Gates: High-risk tools (e.g., execute_infrastructure_action) are programmatically locked. The agent must receive an approved payload via ToolContext before execution.
+   * State-Aware Termination: If a human operator denies a request, the RemediationAgent is logic-bound to immediately halt all workflows to prevent system drift.
+   * Immutable Audit Trail: Every agent decision and human intervention is appended to incident_timeline.txt, ensuring a non-repudiable log for Postmortems.
+
+### Potential Extensions
+
+   * RBAC Integration: Connect request_human_approval to an Identity Provider (IDP) to restrict approval authority to the active On-Call Lead.
+   * Policy-as-Code: Integrate Open Policy Agent (OPA) to define "No-Fly Zones" (e.g., "Block restarts during peak traffic") that the agent checks before prompting a human.
+   * Redaction Layer: Add a middleware tool to strip PII or secrets from logs before they are processed by the StatusUpdateAgent.
+
+
 ## Configuration & Installation
 Prerequisites
    * Python 3.10+
-   * Ollama: access to the mistral-nemo:12b model.
+   * Ollama: access to the mistral-nemo:12b model (or your chosen model).
    * LiteLLM: initializes an LLM instance allowing you to interact with a model.
+   * MCP Server: provides a standardized interface for the agent to query and persist runbooks in the SQLite database.
    * Google Account (Optional): Only needed if you choose to deploy the agent to Google Cloud services like Vertex AI Agent Engine later. Local development with Ollama models does not require this setup.
 
 ### Setup
@@ -170,7 +226,7 @@ Prerequisites
 4. Install dependencies:
 
     ```
-    pip install google-adk litellm httpx python-dotenv prometheus_client
+    pip install google-adk litellm httpx python-dotenv
     ```
 
 5. Configure Environment Variables:
@@ -214,31 +270,6 @@ python3 incident_response/agent.py
 Follow the prompts to trigger incidents, run triage, apply remediation, and generate postmortems.
 
 
-## Prometheus Metrics
-
-The agent exposes key metrics via Prometheus:
-
-* ```sre_agent_incidents_resolved``` – Total incidents handled.
-* ```sre_agent_health_status``` – Current health of the response agent (1=OK, 0=FAIL).
-* ```sre_incidents``` – Total incidents processed.
-
-Metrics are written to the multiprocess directory defined by PROMETHEUS_MULTIPROC_DIR.
-
-**Configuration**
-
-The system requires the PROMETHEUS_MULTIPROC_DIR environment variable to be set. This directory is used by Prometheus to aggregate metrics across processes. Add to your .env file:
-
-```
-PROMETHEUS_MULTIPROC_DIR=<full path to Prometheus metrics>
-```
-
-Ensure the directory exists and is writable by the running process.
-
-**Installing Prometheus**
-
-If Prometheus is not already installed, refer to the official installation documentation: https://prometheus.io/docs/prometheus/latest/installation/
-
-
 ## Generated Files
 
 When the agent is run locally, specific Python functions write various incident-related documents to the filesystem. The following functions create the corresponding files:
@@ -254,7 +285,6 @@ When the agent is run locally, specific Python functions write various incident-
 * Supports both CLI simulations (incident_response/agent.py) and interactive workflows via ADK Web.
 * LLM interactions handled through LiteLlm, which interfaces with the local Ollama Mistral model.
 * Human-in-the-Loop logic enforced in RemediationAgent: high-risk actions cannot execute without explicit operator approval.
-* Metrics exposed via prometheus_client for monitoring; multiprocess aggregation uses PROMETHEUS_MULTIPROC_DIR.
 * Incident data persists in JSON, text, and Markdown files (incident_state.json, incident_timeline.txt, {report_type}_{uuid}.md) for auditability.
 * Virtual environments recommended (venv) to isolate dependencies.
 * Logging is handled via the agents’ update functions; all actions are appended to the incident timeline.
