@@ -10,39 +10,28 @@ from agent import root_agent
 SHARED_USER_ID = "sre_agent_app"
 APP_NAME = "SRE_Triage_App"
 
-# Cache the session service and runner to avoid recreating on every rerun
-@st.cache_resource
-def get_session_service():
-    service = InMemorySessionService()
-    # Limit in-memory sessions to prevent unbounded memory growth
-    service.max_sessions = 10  # Keep only last 10 sessions in memory
-    return service
+if "session_service" not in st.session_state:
+    st.session_state.session_service = InMemorySessionService()
 
-@st.cache_resource
-def get_runner(session_service):
-    return Runner(
+if "runner" not in st.session_state:
+    st.session_state.runner = Runner(
         app_name=APP_NAME,
-        agent=root_agent, 
-        session_service=session_service
+        agent=root_agent,
+        session_service=st.session_state.session_service,
     )
 
-# Initialize the Session Service (Global for the app)
-if "session_service" not in st.session_state:
-    st.session_state.session_service = get_session_service()
+runner = st.session_state.runner
 
 if "session_id" not in st.session_state:
     st.session_state.session_id = f"INC-{uuid.uuid4().hex[:8].upper()}"
-    
-    async def create_new_session():
-        await st.session_state.session_service.create_session(
+
+    asyncio.run(
+        st.session_state.session_service.create_session(
             app_name=APP_NAME,
             user_id=SHARED_USER_ID,
-            session_id=st.session_state.session_id
+            session_id=st.session_state.session_id,
         )
-    asyncio.run(create_new_session())
-
-# Setup the Runner with the required keyword argument
-runner = get_runner(st.session_state.session_service)
+    )
 
 # Page Configuration
 st.set_page_config(page_title="SRE Triage Dashboard", layout="wide")
@@ -98,14 +87,15 @@ if prompt := st.chat_input("Describe the incident (e.g., 'Payment service 503 er
                 chunk = ""
                 if hasattr(event, 'text') and event.text:
                     chunk = event.text
-                # Check for nested GenAI parts structure
-                elif hasattr(event, 'content') and hasattr(event.content, 'parts'):
+
+                elif hasattr(event, 'content') and event.content and event.content.parts:
                     for part in event.content.parts:
-                        if hasattr(part, 'text') and part.text is not None:
+                        if getattr(part, "text", None):
                             chunk += part.text
-                        elif hasattr(part, 'function_call'):
-                            tool_name = part.function_call.name
-                            print(f"Agent is calling tool: {tool_name}")
+
+                        elif getattr(part, "function_call", None):
+                            print(f"Agent is calling tool: {part.function_call.name}"
+            )
                 
                 # Update UI only if we actually found text
                 if chunk:

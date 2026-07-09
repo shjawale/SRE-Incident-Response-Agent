@@ -10,6 +10,7 @@ from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 from google import adk
+from google.adk.tools import AgentTool
 from google.adk.agents import Agent, SequentialAgent
 from google.adk.models.lite_llm import LiteLlm
 from google.adk.tools import FunctionTool, ToolContext
@@ -39,16 +40,20 @@ logger = logging.getLogger("SRE-Main-Orchestrator")
 
 
 # Lazy load the model to defer memory allocation
-MODEL_NAME = os.getenv("SRE_MODEL_NAME", "ollama_chat/mistral-nemo:12b")
+MODEL_NAME = os.getenv("SRE_MODEL_NAME", "ollama_chat/qwen2.5:7b")
 _SRE_MODEL = None
 
 
 def get_sre_model():
-    """Lazy-load the model only when first used, reducing startup memory."""
     global _SRE_MODEL
     if _SRE_MODEL is None:
-        _SRE_MODEL = LiteLlm(model=MODEL_NAME, api_base="http://localhost:11434", num_ctx=4096)
+        # Changing to 'ollama_chat' enforces user/assistant conversational separation
+        #_SRE_MODEL = LiteLlm(model="ollama_chat/phi:latest", api_base="http://ollama:11434", num_ctx=4096)
+        _SRE_MODEL = LiteLlm(model=MODEL_NAME, api_base="http://localhost:11434", num_ctx=4096,
+)
     return _SRE_MODEL
+
+
 
 # For backward compatibility with existing code
 @property
@@ -56,7 +61,7 @@ def SRE_MODEL():
     return get_sre_model()
     
 # Simplified reference for agent definitions below
-SRE_MODEL = None  # Will be replaced dynamically
+SRE_MODEL = get_sre_model()  # Will be replaced dynamically
 
 
 def fetch_telemetry_checkpoint(service_name: str) -> str:
@@ -318,6 +323,8 @@ def generate_incident_id():
     return incident_id
 
 
+
+
 #Agents
 triage_agent = Agent(
     name='TriageAgent',
@@ -327,9 +334,7 @@ triage_agent = Agent(
     Create a short incident report. Identify the core technical issues. 
     Acknowledge missing data and if needed, ask specific technical questions before attempting a transfer.""",
     tools=[
-        analyze_stack_trace, 
-        generate_mock_logs, 
-        analyze_large_logs_for_patterns
+        generate_mock_logs
     ],
     output_key="triage_report"
 )
@@ -355,35 +360,8 @@ knowledge_agent = Agent(
     output_key="foundrunbooks"
 )
 
-
-runbook_agent = Agent(
-    name='RunbookAgent',
-    model=SRE_MODEL,
-    instruction="""You are a specialized report creating agent. 
-    First you will use the triaged report from TriageAgent agent to create a query to the runbooks database.
-    Then call search_runbooks with the query to find the most similar past runbooks to the current incident.     
-    If you found a past runbook, return its content.
-    If you have not found a runbook, take the triaged incident report and create a suggested runbook that is clearly labeled.
-    Note down if you are using a saved runbook so persistence_agent does not try to save it again.
-    This is for internal use within the company.""",
-    tools=[
-        McpToolset(
-            connection_params=StdioConnectionParams(
-                server_params=StdioServerParameters(
-                    command="python3",
-                    args=[RUNBOOK_MCP_SERVER]
-                )
-            ),
-            tool_filter=["search_runbooks"]
-        ),
-        suggest_runbook_steps
-    ],
-    output_key="runbooks",
-)
-
-
 persistence_agent = Agent(
-    name="RunbookPersistenceAgent",
+    name='RunbookPersistenceAgent',
     instruction="""If rumbook agent is using an existing runbook, do not save it again.
     Only save the runbook if it is a new generated runbook.
     Save the runbook provided by the previous agent to the database using your save_runbook tool. 
@@ -417,35 +395,9 @@ remediation_agent = Agent(
     tools=[
         FunctionTool(request_human_approval, require_confirmation=True),
         execute_infrastructure_action,
-        verify_canary_health, 
-        run_synthetic_probe, 
-        track_error_budget, 
-        simulate_chaos_test
     ],
     output_key="remediation_results"
 )
-
-
-postmortem_agent = Agent(
-    name='PostmortemAgent',
-    model=SRE_MODEL,
-    instruction="""Compile all logs into a 'blameless_postmortem' and archive it for internal use within the company.
-    Do not respond to remediation_agent's question of approval.
-    Take the triaged incident report, suggested runbook and any other information the user has provided to create a postmortem report.""",
-    tools=[archive_validated_report],
-    output_key="final_postmortem"
-)
-
-
-status_update_agent = Agent(
-    name='StatusUpdateAgent',
-    model=SRE_MODEL,
-    instruction="""Translate technical logs into clear updates for non-technical stakeholders. Identify the audience. 
-    For technical channels, include the specific Error Pattern and Remediation Action. 
-    For executive channels, focus on Service Availability, SLA Impact, and the Estimated Time to Resolution (ETR). """,
-    tools=[send_external_notification]
-)
-
 
 
 # Database setup using SQLModel
@@ -495,11 +447,19 @@ root_agent = SequentialAgent(
     
     Strict Constraints
     Do not announce transfers textually. Execute the tool call only.
-    Never identify root causes; always delegate to the TriageAgent.
+    Never identify root causes; always delegate to the triage_agent.
     Every tool call or agent transfer must be logged via update_incident_timeline.
     If the user requests a specific phase (e.g., "Run triage"), jump directly to that step.
     """,
     sub_agents=[
+        triage_agent,
+        knowledge_agent,
+        persistence_agent,
+        remediation_agent,
+    ]
+)
+
+'''
         triage_agent,
         knowledge_agent,
         runbook_agent,
@@ -507,8 +467,8 @@ root_agent = SequentialAgent(
         remediation_agent,
         postmortem_agent,
         status_update_agent
-    ]
-)
+
+'''
 
 
 APP_NAME = "sre_app"
