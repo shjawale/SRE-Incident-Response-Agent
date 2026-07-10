@@ -47,8 +47,6 @@ _SRE_MODEL = None
 def get_sre_model():
     global _SRE_MODEL
     if _SRE_MODEL is None:
-        # Changing to 'ollama_chat' enforces user/assistant conversational separation
-        #_SRE_MODEL = LiteLlm(model="ollama_chat/phi:latest", api_base="http://ollama:11434", num_ctx=4096)
         _SRE_MODEL = LiteLlm(model=MODEL_NAME, api_base="http://localhost:11434", num_ctx=4096,
 )
     return _SRE_MODEL
@@ -60,8 +58,8 @@ def get_sre_model():
 def SRE_MODEL():
     return get_sre_model()
     
-# Simplified reference for agent definitions below
-SRE_MODEL = get_sre_model()  # Will be replaced dynamically
+
+SRE_MODEL = get_sre_model()
 
 
 def fetch_telemetry_checkpoint(service_name: str) -> str:
@@ -428,9 +426,7 @@ def log_incident_to_db(service: str, status: str) -> str:
         return f"Database updated: {service} set to {status}"
 
 
-# Initialize DB before starting
 init_db()
-
 
 root_agent = SequentialAgent(
     name='root_agent',
@@ -458,17 +454,6 @@ root_agent = SequentialAgent(
         remediation_agent,
     ]
 )
-
-'''
-        triage_agent,
-        knowledge_agent,
-        runbook_agent,
-        persistence_agent,
-        remediation_agent,
-        postmortem_agent,
-        status_update_agent
-
-'''
 
 
 APP_NAME = "sre_app"
